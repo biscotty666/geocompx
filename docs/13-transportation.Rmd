@@ -1,0 +1,418 @@
+---
+title: "Ch 13 Transportation"
+---
+
+```{r}
+library(sf)
+library(dplyr)
+library(spDataLarge)
+library(stplanr)      # for processing geographic transport data
+library(tmap)         # map making (see Chapter 9)
+library(ggplot2)      # data visualization package
+library(sfnetworks)   # spatial network classes and functions 
+```
+
+# Geographical Analysis transport systems
+
+This chapter introduces the geographic analysis of transport systems at different geographic levels:
+
+-   **Areal units**: transport patterns can be understood with reference to zonal aggregates, such as the main mode of travel (by car, bike or foot, for example), and average distance of trips made by people living in a particular zone, covered in Section [13.3](https://r.geocompx.org/transport#transport-zones)
+-   **Desire lines**: straight lines that represent ‘origin-destination’ data that records how many people travel (or could travel) between places (points or zones) in geographic space, the topic of Section [13.4](https://r.geocompx.org/transport#desire-lines)
+-   **Nodes**: these are points in the transport system that can represent common origins and destinations and public transport stations such as bus stops and rail stations, the topic of Section [13.5](https://r.geocompx.org/transport#nodes)
+-   **Routes**: these are lines representing a path along the route network along the desire lines and between nodes. Routes (which can be represented as single linestrings or multiple short *segments*) and the *routing engines* that generate them, are covered in Section [13.6](https://r.geocompx.org/transport#routes)
+-   **Route networks**: these represent the system of roads, paths and other linear features in an area and are covered in Section [13.7](https://r.geocompx.org/transport#route-networks). They can be represented as geographic features (typically short segments of road that add up to create a full network) or structured as an interconnected graph, with the level of traffic on different segments referred to as ‘flow’ by transport modelers ([Hollander 2016](https://r.geocompx.org/references#ref-hollander_transport_2016))
+
+Other levels:
+
+-   **Agents**: mobile entities like you and me and vehicles that enable us to move such as bikes and buses. These can be represented computationally in software such as [MATSim](http://www.matsim.org/) and [A/B Street](https://github.com/a-b-street/abstreet), which represent the dynamics of transport systems using an agent-based modeling (ABM) framework, usually at high levels of spatial and temporal resolution ([Horni, Nagel, and Axhausen 2016](https://r.geocompx.org/references#ref-horni_multi-agent_2016)). ABM is a powerful approach to transport research with great potential for integration with R’s spatial classes ([Thiele 2014](https://r.geocompx.org/references#ref-thiele_r_2014); [Lovelace and Dumont 2016](https://r.geocompx.org/references#ref-lovelace_spatial_2016)), but is outside the scope of this chapter.
+-   **Trip**: a single purpose journey from an origin ‘A’ to a destination ‘B’ ([Hollander 2016](https://r.geocompx.org/references#ref-hollander_transport_2016)). Trips join-up the different levels of transport systems and can be represented simplistically as geographic *desire lines* connecting *zone* centroids (*nodes*) or as routes that follow the transport *route network*. In this context, *agents* are usually point entities that move within the transport network.
+
+In this chapter you will learn how to:
+
+-   Describe the geographical patterns of transport behavior in cities
+-   Identify key public transport nodes supporting multi-modal trips
+-   Analyze travel ‘desire lines’ to find where many people drive short distances
+-   Identify cycle route locations that will encourage less car driving and more cycling
+
+# Case study: Bristol
+
+```{r}
+library(tmap)
+region_all = rbind(bristol_region, bristol_ttwa)
+tmap_mode("view")
+tm_shape(region_all[1, ], bbox = region_all) +
+  tm_fill("yellow", col_alpha = 0.5) +
+  tm_shape(bristol_ways) +
+  tm_lines(col = "highway", lwd = 2.1, col.scale = tm_scale(values = "-Set1")) +
+  tm_scalebar() +
+  tm_shape(region_all) +
+  tm_borders(col = "black") +
+  tm_basemap(server = leaflet::providers$Esri.WorldTopoMap)
+```
+
+# Transport zones
+
+-   Breaking areal data into tangible units
+-   Origin and desination zones (often same)
+-   **Workplace zones** for high density of trip destinations in areas with "trip attractors"
+
+The simplest way to define a study area is often the first matching boundary returned by OpenStreetMap. This can be done with a command such as `osmdata::getbb("Bristol", format_out = "sf_polygon", limit = 1)`. This returns an `sf` object (or a list of `sf` objects if `limit = 1` is not specified) representing the bounds of the largest matching city region, either a rectangular polygon of the bounding box or a detailed polygonal boundary.
+
+The geographic resolution of these zones is important: small zones with high geographic resolution are usually preferable but their high number in large regions can have consequences for processing (especially for origin-destination analysis in which the number of possibilities increases as a non-linear function of the number of zones)
+
+The 102 zones used in this chapter are stored in `bristol_zones`
+
+```{r}
+names(bristol_zones)
+```
+
+```{r}
+names(bristol_od)
+```
+
+```{r}
+nrow(bristol_od)
+nrow(bristol_zones)
+```
+
+```{r}
+zones_attr <- bristol_od |> 
+  group_by(o) |> 
+  summarise(across(where(is.numeric), sum)) |> 
+  rename(geo_code = o)
+```
+
+```{r}
+summary(zones_attr$geo_code %in% bristol_zones$geo_code)
+```
+
+```{r}
+# zones_joined = left_join(bristol_zones, zones_attr, by = "geo_code")
+zones_joined <- left_join(bristol_zones, zones_attr)
+sum(zones_joined$all)
+names(zones_joined)
+```
+
+```{r}
+zones_destinations <- bristol_od |> 
+  group_by(d) |> 
+  summarise(across(where(is.numeric), sum)) |> 
+  select(geo_code = d, all_dest = all)
+zones_od <- inner_join(zones_joined, zones_destinations, by = "geo_code")
+```
+
+```{r}
+qtm(zones_od, c("all", "all_dest")) +
+  tm_layout(panel.labels = c("Origin", "Destination"))
+```
+
+```{r}
+tmap_mode("plot")
+tm_shape(zones_od) + 
+  tm_fill(c("all", "all_dest"), 
+          fill.scale = tm_scale(values =  viridis::plasma(4), breaks = c(0, 2000, 4000, 10000, 50000)),
+          fill.legend = tm_legend(title = "Trips", position = tm_pos_out("right", "center")),
+          fill.free = FALSE)  +
+  tm_facets() +
+  tm_borders(col = "black", lwd = 0.5) + 
+  tm_layout(panel.labels = c("Zone of origin", "Zone of destination"))
+```
+
+# Desire lines
+
+```{r}
+od_top5 <- bristol_od |> 
+  slice_max(all, n = 5)
+od_top5 |> print.AsIs()
+```
+
+Note the first line which is intra-zonal, and the top five have the same destination.
+
+The following command calculates the percentage of each desire line that is made by the active modes (foot and bike):
+
+```{r}
+bristol_od$Active <- (bristol_od$bicycle + bristol_od$foot) /
+  bristol_od$all * 100
+```
+
+Divide into intra and inter zone travel
+
+```{r}
+od_intra <- filter(bristol_od, o == d)
+od_inter <- filter(bristol_od, o != d)
+```
+
+```{r}
+desire_lines <- od2line(od_inter, zones_od)
+```
+
+```{r}
+qtm(desire_lines, lines.lwd = "all")
+```
+
+```{r}
+tmap_mode("plot")
+desire_lines_top5 = od2line(od_top5, zones_od)
+# tmaptools::palette_explorer()
+tm_shape(desire_lines) +
+  tm_lines(col = "Active",
+           col.scale = tm_scale(values = viridis::plasma(5), breaks = c(0, 5, 10, 20, 40, 100)),
+           col.legend = tm_legend(title = "Active travel (%)"),
+           col_alpha = 0.6,
+           lwd = "all",
+           #lwd.scale = tm_scale(values.scale = 2),
+           lwd.legend = tm_legend(title = "Number of trips"))  +
+  tm_shape(desire_lines_top5) +
+  tm_lines(lwd = 5, col = "black", col_alpha = 0.7) +
+  tm_scalebar()
+```
+
+# Nodes
+
+Broadly are two main types of transport nodes:
+
+1.  Nodes not directly on the network such as zone centroids or individual origins and destinations such as houses and workplaces
+2.  Nodes that are a part of transport networks. Technically, a node can be located at any point on a transport network but in practice they are often special kinds of vertex such as intersections between pathways (junctions) and points for entering or exiting a transport network such as bus stops and train stations
+
+Public transport stops are particularly important nodes that can be represented as either type of node: a bus stop that is part of a road, or a large rail station that is represented by its pedestrian entry point hundreds of meters from railway tracks.
+
+From an active travel perspective, public transport ‘legs’ of longer journeys divide trips into three:
+
+The origin leg, typically from residential areas to public transport stations The public transport leg, which typically goes from the station nearest a trip’s origin to the station nearest its destination The destination leg, from the station of alighting to the destination
+
+```{r}
+desire_rail <- top_n(desire_lines, n = 3, wt = train)
+```
+
+The challenge now is to ‘break-up’ each of these lines into three pieces, representing travel via public transport nodes. This can be done by converting a desire line into a multilinestring object consisting of three line geometries representing origin, public transport and destination legs of the trip. This operation can be divided into three stages: matrix creation (of origins, destinations and the ‘via’ points representing rail stations), identification of nearest neighbors and conversion to multilinestrings.
+
+Takes an origin (A) and destination (B), represented by the linestring `l`, and generates 3 extra geometries based on points `p`
+
+1.  From A to P1 (P1 being the nearest point to A)
+2.  From P1 to P2 (P2 being the nearest point to B)
+3.  From P2 to B
+
+```{r}
+ncol(desire_rail)
+desire_rail <- line_via(desire_rail, bristol_stations)
+ncol(desire_rail)
+```
+
+```{r}
+zone_cents = st_centroid(zones_od)
+zone_cents_rail = zone_cents[desire_rail, ]
+bb = tmaptools::bb(desire_rail, ext = 1.1)
+desire_rail_plot = rbind(
+  st_sf(data.frame(Geometry = "Desire line (original)"), geometry = desire_rail$geometry),
+  st_sf(data.frame(Geometry = "Leg 1 (origin to station)"), geometry = desire_rail$leg_orig),
+  st_sf(data.frame(Geometry = "Leg 2 (station to station)"), geometry = desire_rail$leg_via),
+  st_sf(data.frame(Geometry = "Leg 3 (station to destination)"), geometry = desire_rail$leg_dest)
+) 
+desire_rail_plot = desire_rail_plot |> 
+  mutate(lty = case_when(Geometry == "Desire line (original)" ~ 2, TRUE ~ 1)) |> 
+  mutate(size = case_when(Geometry == "Desire line (original)" ~ 1, TRUE ~ 2))
+bristol_rail_points = rbind(
+  st_sf(data.frame(
+    Node = "Origin and destination locations",
+    col = "black"
+    ), geometry = zone_cents_rail$geometry),
+  st_sf(data.frame(
+    Node = "Public transport node",
+    col = "red"
+    ), geometry = bristol_stations$geometry)
+)
+tm_shape(zones_od) +
+  tm_fill(fill_alpha = 0.2, lwd = 0.1) +
+  tm_shape(desire_rail_plot, bbox = bb, is.main = TRUE) +
+  tm_lines(col = "Geometry",
+           col.scale = tm_scale(values = "Set2"),
+           col.legend = tm_legend(position = tm_pos_in("left", "top")),
+           lwd = 2,
+           lty = "lty",
+           lty.scale = tm_scale_categorical(),
+           lty.legend = tm_legend_hide()) +
+  tm_shape(bristol_rail_points) +
+  tm_symbols(fill = "col", size = 0.75) +
+  tm_scalebar()
+```
+
+# Routes
+
+Routing engines can be classified based on *where* they run relative to R:
+
+-   In-memory routing using R packages that enable route calculation (described in Section [13.6.2](https://r.geocompx.org/transport#memengine))
+-   Locally hosted routing engines external to R that can be called from R (Section [13.6.3](https://r.geocompx.org/transport#localengine))
+-   Remotely hosted routing engines by external entities that provide a web API that can be called from R (Section [13.6.4](https://r.geocompx.org/transport#remoteengine))
+
+## Routes, legs and segments
+
+-   **Route** level outputs contain a single feature (typically a multilinestring and associated row in the data frame representation) per origin-destination pair, meaning a single row of data per trip
+-   **Leg** level outputs contain a single feature and associated attributes each *mode* within each origin-destination pair, as described in Section [13.5](https://r.geocompx.org/transport#nodes). For trips only involving one mode (for example driving from home to work, ignoring the short walk to the car) the leg is the same as the route: the car journey. For trips involving public transport, legs provide key information. The **r5r** function `detailed_itineraries()` returns legs which, confusingly, are sometimes referred to as ‘segments’
+-   Segment level outputs provide the most detailed information about routes, with records for each small section of the transport network. Typically segments are similar in length, or identical to, ways in OpenStreetMap. The **cyclestreets** function `journey()` returns data at the segment level which can be aggregated by grouping by origin and destination level data returned by the [`route()`](https://docs.ropensci.org/stplanr/reference/route.html) function in **stplanr**
+
+Most routing engines return route level by default, although multi-modal engines generally provide outputs at the leg level (one feature per continuous movement by a single mode of transport). Segment level outputs have the advantage of providing more detail. The **cyclestreets** package returns multiple ‘quietness’ levels per route, enabling identification of the ‘weakest link’ in cycle networks. Disadvantages of segment level outputs include increased file sizes and complexities associated with the extra detail.
+
+Routing engines:
+
+-   **In-memory with R**: [**sfnetworks**](https://luukvdmeer.github.io/sfnetworks/), [**dodgr**](https://urbananalyst.github.io/dodgr/) and [**cppRouting**](https://github.com/vlarmet/cppRouting) packages
+-   **Locally hosted dedicated routing engines**: OpenTripPlanner, [Valhalla](https://github.com/valhalla/valhalla), and R5 (which are multi-modal), and the OpenStreetMap Routing Machine (OSRM) (which is ‘uni-modal’). These can be accessed from R with the packages **opentripplanner**, [**valhallr**](https://github.com/chris31415926535/valhallr), **r5r** and [**osrm**](https://github.com/riatelab/osrm)
+-   **Remotely hosted dedicated routing engines**: [**googleway**](http://symbolixau.github.io/googleway/)**,** [**mapbox**](https://walker-data.com/mapboxapi/articles/navigation.html) , [**osrm**](https://rgeomatic.hypotheses.org/category/osrm) and [**openrouteservice**](https://github.com/GIScience/openrouteservice-r) , [**cyclestreets**](https://rpackage.cyclestreets.net/)
+
+Contraction heirarchies:
+
+well-known algorithm that can lead to a substantial (1000x+ in some cases) speed-up in routing tasks, accessed by `cppRouting`.
+
+## Routing example
+
+```{r}
+desire_lines$distance_km <- as.numeric(st_length(desire_lines)) / 1000
+desrie_lines_short <- desire_lines |> 
+  filter(car_driver >= 100, distance_km <= 5, distance_km >= 2.5)
+```
+
+```{r}
+routes_short <- route(l = desrie_lines_short, route_fun = route_osrm,
+                      osrm.profile = "bike")
+```
+
+```{r}
+routes_plot_data = rbind(
+  desrie_lines_short |> transmute(Entity = "Desire lines") |> sf::st_set_crs("EPSG:4326"),
+  routes_short |> transmute(Entity = "Routes") |> sf::st_set_crs("EPSG:4326")
+)
+zone_cents_routes = zone_cents[desrie_lines_short, ]
+tm_shape(zones_od) +
+  tm_fill(fill_alpha = 0.2, lwd = 0.1) +
+  tm_shape(desrie_lines_short, is.main = TRUE) + 
+  tm_lines(lty = 2) +
+  tm_shape(routes_short) +
+  tm_lines(col = "red") +
+  tm_add_legend(title = "Entity", labels = c("Desire lines", "Routes"),
+                type = "lines", col = c("black", "red"), lty = c(2, 1),
+                position = tm_pos_in("left", "top")) +
+  tm_shape(zone_cents_routes) +
+  tm_symbols(fill = "black", size = 0.5) +
+  tm_scalebar()
+```
+
+# Route networks
+
+While routes generally contain data on travel behavior, at the same geographic level as desire lines and OD pairs, route network datasets usually represent the physical transport network. Each *segment* in a route network roughly corresponds to a continuous section of street between junctions and appears only once, although the average length of segments depends on the data source
+
+To demonstrate how to create route networks as an output derived from route level data, imagine a simple scenario of mode shift. Imagine that 50% of car trips between 0 to 3 km in route distance are replaced by cycling, a percentage that drops by 10 percentage points for every additional km of route distance so that 20% of car trips of 6 km are replaced by cycling and no car trips that are 8 km or longer are replaced by cycling. This is of course an unrealistic scenario (Lovelace et al. 2017), but is a useful starting point. In this case, we can model mode shift from cars to bikes as follows:
+
+```{r}
+uptake <- function(x) {
+  case_when(
+    x <= 3 ~ 0.5,
+    x >= 8 ~ 0,
+    .default = (8 - x) / ( 8 - 3) * 0.5
+  )
+}
+```
+
+```{r}
+routes_short_scenario <- routes_short |> 
+  mutate(uptake = uptake(distance / 1000)) |> 
+  mutate(bicycle = bicycle + car_driver * uptake,
+         car_driver = car_driver * (1-uptake))
+sum(routes_short_scenario$bicycle) - sum(routes_short$bicycle)
+```
+
+```{r}
+route_network_scenario <- overline(routes_short_scenario, attrib = "bicycle")
+```
+
+```{r}
+routes_short_scenario |> 
+  ggplot() +
+  geom_line(aes(distance / 1000, uptake), color = "red", linewidth = 3) +
+  labs(x = "Route distance (km)", y = NULL, title = "Percent trips switching from driving to cycling") +
+  scale_y_continuous(labels = scales::percent)
+tm_shape(zones_od) +
+  tm_fill(fill_alpha = 0.2, lwd = 0.1) +
+  tm_shape(route_network_scenario, is.main = TRUE) +
+  tm_lines(lwd = "bicycle", 
+           lwd.scale = tm_scale(values.scale = 1.5),
+           lwd.legend = tm_legend(title = "Number of bike trips per day\n(modeled, one direction)",
+                                  position = tm_pos_in("left", "top")),
+           col = "red")
+```
+
+Transport networks with records at the segment level, typically with attributes such as road type and width, constitute a common type of route network. Such route network datasets are available worldwide from OpenStreetMap, and can be downloaded with packages such as osmdata and osmextract. To save time downloading and preparing OSM, we will use the bristol_ways object from the spDataLarge package, an sf object with LINESTRING geometries and attributes representing a sample of the transport network in the case study region (see ?bristol_ways for details), as shown in the output below:
+
+```{r}
+summary(bristol_ways)
+```
+
+```{r}
+bristol_ways$lengths <- st_length(bristol_ways)
+ways_sfn <- as_sfnetwork(bristol_ways)
+class(ways_sfn)
+```
+
+```{r}
+ways_sfn
+```
+
+```{r}
+ways_centrality <- ways_sfn |> 
+  activate("edges") |> 
+  mutate(betweenness = tidygraph::centrality_edge_betweenness(lengths))
+```
+
+```{r}
+bb_wayssln <-  tmaptools::bb(route_network_scenario, xlim = c(0.1, 0.9), ylim = c(0.1, 0.6), relative = TRUE)
+tm_shape(zones_od) +
+  tm_fill(fill_alpha = 0.2, lwd = 0.1) +
+  tm_shape(ways_centrality |> st_as_sf(), bb = bb_wayssln, is.main = TRUE) +
+  tm_lines(lwd = "betweenness", 
+           lwd.scale = tm_scale(n = 2, values.scale = 2),
+           lwd.legend = tm_legend(title = "Betweenness"),
+           col = "#630032", col_alpha = 0.75) +
+  tm_shape(route_network_scenario) +
+  tm_lines(lwd = "bicycle",
+           lwd.scale = tm_scale(n = 2, values.scale = 2),
+           lwd.legend = tm_legend(title = "Number of bike trips (modeled, one direction)"),
+           col = "darkgreen", col_alpha = 0.75) +
+  tm_scalebar()
+```
+
+# Prioritizing new infrastructure
+
+```{r}
+existing_cycleways_buffer <- bristol_ways |> 
+  filter(highway == "cycleway") |> 
+  st_union() |> 
+  st_buffer(dist = 100)
+```
+
+```{r}
+rns_buffed <- route_network_scenario |> st_set_crs(st_crs(existing_cycleways_buffer))
+```
+
+
+```{r}
+route_network_no_infra <- st_difference(
+  route_network_scenario,
+  rns_buffed,
+  existing_cycleways_buffer
+)
+```
+
+```{r}
+waldo::compare(
+  sf::st_crs(route_network_scenario),
+  sf::st_crs(existing_cycleways_buffer)
+)
+```
+
+```{r}
+tmap_mode("view")
+qtm(route_net)
+```
+
+
+
+
+

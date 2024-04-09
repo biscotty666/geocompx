@@ -1,0 +1,357 @@
+---
+title: "Ch 7 Reprojecting geographic data"
+---
+
+```{r}
+library(sf)
+library(terra)
+library(dplyr)
+library(spData)
+library(spDataLarge)
+```
+
+Most commonly used: The WKT representation of the WGS84 CRS, which has the **identifier** `EPSG:4326`
+
+```{r}
+st_crs("EPSG:4326")
+```
+
+Alternate systems exist, eg.
+
+```{r}
+st_crs("ESRI:54030")
+```
+
+# Querying and setting coordinate systems
+
+## Vector
+
+```{r}
+new_vector <- read_sf(system.file("shapes/world.gpkg",
+                                  package = "spData"))
+```
+
+```{r}
+st_crs(new_vector)
+```
+
+```{r}
+st_crs(new_vector)$IsGeographic
+st_crs(new_vector)$units_gdal
+st_crs(new_vector)$srid
+st_crs(new_vector)$proj4string
+```
+
+```{r}
+new_vector <- st_set_crs(new_vector, "EPSG:4326")
+st_crs(new_vector)
+```
+
+```{r}
+st_crs(new_vector)$IsGeographic
+st_crs(new_vector)$units_gdal
+st_crs(new_vector)$srid
+st_crs(new_vector)$proj4string
+```
+
+## Raster
+
+```{r}
+my_rast <- rast(system.file("raster/srtm.tif",
+                            package = "spDataLarge"))
+cat(crs(my_rast))
+```
+
+```{r}
+crs(my_rast) <- "EPSG:26912"
+```
+
+In some cases the CRS of a geographic object is unknown, as is the case in the london dataset created in the code chunk below, building on the example of London introduced in Section 2.2:
+
+```{r}
+london <- data.frame(lon = -0.1, lat = 51.5) |> 
+  st_as_sf(coords = c("lon", "lat"))
+st_is_longlat(london)
+```
+
+```{r}
+london_geo <-  st_set_crs(london, "EPSG:4326")
+st_is_longlat(london_geo)
+```
+
+# Geometry operations
+
+To demonstrate the importance of CRSs, we will create buffer of 100 km around the `london` object from the previous section. We will also create a deliberately faulty buffer with a ‘distance’ of 1 degree, which is roughly equivalent to 100 km (1 degree is about 111 km at the equator). Before diving into the code, it may be worth skipping briefly ahead to peek at Figure [7.2](https://r.geocompx.org/reproj-geo-data#fig:crs-buf) to get a visual handle on the outputs that you should be able to reproduce by following the code chunks below.
+
+The first stage is to create three buffers around the `london` and `london_geo` objects created above with boundary distances of 1 degree and 100 km (or 100,000 m, which can be expressed as `1e5` in scientific notation) from central London:
+
+```{r}
+london_buff_no_crs <- st_buffer(london, dist = 1) #wrong, no CRS
+london_buff_s2 <- st_buffer(london_geo, dist = 1e5) #crs from london_geos
+london_buff_s2_100_cells <- st_buffer(london_geo, dist = 1e5,
+                                      max_cell = 100)
+```
+
+```{r}
+sf::sf_use_s2(FALSE)
+london_buff_lonlat = st_buffer(london_geo, dist = 1) # incorrect result
+sf::sf_use_s2(TRUE)
+```
+
+But for operations involving distances such as buffering, the only way to ensure a good result (without using spherical geometry engines) is to create a projected copy of the data and run the operation on that. This is done in the code chunk below.
+
+The result is a new object that is identical to `london`, but created using a suitable CRS (the British National Grid, which has an EPSG code of 27700 in this case) that has units of meters.
+
+```{r}
+london_proj <- data.frame(x = 530000, y = 180000) |> 
+  st_as_sf(coords = c("x", "y"), crs = "EPSG:27700")
+st_crs(london_proj)
+```
+
+The following line of code creates a buffer around *projected* data of exactly 100 km:
+
+```{r}
+london_buff_projected <- st_buffer(london_proj, 1e5)
+```
+
+
+```{r}
+library(tmap)
+```
+
+```{r}
+london_show <- function(map) {
+  tm_shape(map, bbox = st_bbox(london_buff_s2_100_cells)) + 
+    tm_graticules(lwd = 0.2) +
+    tm_borders(col = "black", lwd = 0.5) +
+    tm_shape(uk) +
+    tm_polygons(lty = 3, fill_alpha = 0.2, fill = "#567D46") +
+    tm_shape(london_proj) +
+    tm_symbols()
+}
+```
+
+```{r}
+tm1 <- london_show(london_buff_s2) +
+    tm_shape(london_buff_s2_100_cells) +
+    tm_borders(col = "black", lwd = 1.5)
+
+tm2 <- london_show(london_buff_projected)
+tm3 <- london_show(london_buff_lonlat)
+
+tmap_arrange(tm1, tm2, tm3, nrow = 1)
+```
+
+# Which CRS to use?
+
+When selecting geographic CRSs, the answer is often WGS84. It is used not only for web mapping, but also because GPS datasets and thousands of raster and vector datasets are provided in this CRS by default. WGS84 is the most common CRS in the world, so it is worth knowing its EPSG code: 4326.32 This ‘magic number’ can be used to convert objects with unusual projected CRSs into something that is widely understood.
+
+Often a locally/governmentally defined CRS.
+
+A commonly used default is Universal Transverse Mercator (UTM), a set of CRSs that divides the Earth into 60 longitudinal wedges and 20 latitudinal segments. Almost every place on Earth has a UTM code, such as “60H” which refers to northern New Zealand where R was invented. UTM EPSG codes run sequentially from 32601 to 32660 for northern hemisphere locations and from 32701 to 32760 for southern hemisphere locations.
+
+```{r}
+lonlat2UTM = function(lonlat) {
+  utm = (floor((lonlat[1] + 180) / 6) %% 60) + 1
+  if (lonlat[2] > 0) {
+    utm + 32600
+  } else{
+    utm + 32700
+  }
+}
+```
+
+```{r}
+lonlat2UTM(c(174.7, -36.9))
+lonlat2UTM(st_coordinates(london))
+```
+
+
+When deciding on a custom CRS, we recommend the following:34
+
+- A Lambert azimuthal equal-area (LAEA) projection for a custom local projection (set latitude and longitude of origin to the center of the study area), which is an equal-area projection at all locations but distorts shapes beyond thousands of kilometers
+- Azimuthal equidistant (AEQD) projections for a specifically accurate straight-line distance between a point and the center point of the local projection
+- Lambert conformal conic (LCC) projections for regions covering thousands of kilometers, with the cone set to keep distance and area properties reasonable between the secant lines
+- Stereographic (STERE) projections for polar regions, but taking care not to rely on area and distance calculations thousands of kilometers from the center
+
+# Reprojecting vector geometries
+
+Section 7.5 contains an example in which at least one sf object must be transformed into an equivalent object with a different CRS to calculate the distance between two objects.
+
+```{r}
+st_crs(london_geo)
+```
+
+```{r}
+london2 <- st_transform(london_geo, "EPSG:27700")
+st_crs(london2)
+```
+
+```{r}
+st_distance(london2, london_proj)
+```
+
+# Raster geometries
+
+Let’s take a look at two examples of raster transformation: using categorical and continuous data. Land cover data are usually represented by categorical maps. The nlcd.tif file provides information for a small area in Utah, USA obtained from National Land Cover Database 2011 in the NAD83 / UTM zone 12N CRS, as shown in the output of the code chunk below (only first line of output shown).
+
+```{r}
+cat_raster <- rast(system.file("raster/nlcd.tif", package = "spDataLarge"))
+crs(cat_raster)
+```
+
+```{r}
+unique(cat_raster)
+```
+
+## Nearest neighbor
+
+```{r}
+cat_raster_wgs84 <- project(cat_raster, "EPSG:4326", method = "near")
+```
+
+```{r}
+tibble(
+  CRS = c("NAD83", "WGS84"),
+  nrow = c(nrow(cat_raster), nrow(cat_raster_wgs84)),
+  ncol = c(ncol(cat_raster), ncol(cat_raster_wgs84)),
+  ncell = c(ncell(cat_raster), ncell(cat_raster_wgs84)),
+  resolution = c(mean(res(cat_raster)), mean(res(cat_raster_wgs84),
+                                             na.rm = TRUE)),
+  unique_categories = c(length(unique(values(cat_raster))),
+                        length(unique(values(cat_raster_wgs84)))))
+```
+
+```{r}
+con_raster <- rast(system.file("raster/srtm.tif", package = "spDataLarge"))
+cat(crs(con_raster))
+```
+
+We will reproject this dataset into a projected CRS, but not with the nearest neighbor method which is appropriate for categorical data. Instead, we will use the bilinear method which computes the output cell value based on the four nearest cells in the original raster.37 The values in the projected dataset are the distance-weighted average of the values from these four cells: the closer the input cell is to the center of the output cell, the greater its weight. The following commands create a text string representing WGS 84 / UTM zone 12N, and reproject the raster into this CRS, using the bilinear method (output not shown).
+
+```{r}
+con_raster_ea <- project(con_raster, "EPSG:32612", method = "bilinear")
+cat(crs(con_raster_ea))
+```
+
+```{r}
+tibble(
+  CRS = c("WGS84", "UTM zone 12N"),
+  nrow = c(nrow(con_raster), nrow(con_raster_ea)),
+  ncol = c(ncol(con_raster), ncol(con_raster_ea)),
+  ncell = c(ncell(con_raster), ncell(con_raster_ea)),
+  resolution = c(mean(res(con_raster)), mean(res(con_raster_ea), 
+                                             na.rm = TRUE)),
+  mean = c(mean(values(con_raster)), mean(values(con_raster_ea), 
+                                          na.rm = TRUE))) 
+```
+
+# Custom projections
+
+One is to take an existing WKT definition of a CRS, modify some of its elements, and then use the new definition for reprojecting. This can be done for spatial vectors with st_crs() and st_transform(), and for spatial rasters with crs() and project(), as demonstrated in the following example which transforms the zion object to a custom azimuthal equidistant (AEQD) CRS.
+
+Using a custom AEQD CRS requires knowing the coordinates of the center point of a dataset in degrees (geographic CRS). In our case, this information can be extracted by calculating a centroid of the zion area and transforming it into WGS84.
+
+```{r}
+zion <- read_sf(system.file("vector/zion.gpkg",
+                            package = "spDataLarge"))
+```
+
+```{r}
+zion_centr <- st_centroid(zion)
+zion_centr_wgs84 <- st_transform(zion_centr, "EPSG:4326")
+st_as_text(st_geometry(zion_centr_wgs84))
+```
+
+```{r}
+st_crs(zion)
+```
+
+```{r}
+my_wkt = 'PROJCS["Custom_AEQD",
+ GEOGCS["GCS_WGS_1984",
+  DATUM["WGS_1984",
+   SPHEROID["WGS_1984",6378137.0,298.257223563]],
+  PRIMEM["Greenwich",0.0],
+  UNIT["Degree",0.0174532925199433]],
+ PROJECTION["Azimuthal_Equidistant"],
+ PARAMETER["Central_Meridian",-113.0263],
+ PARAMETER["Latitude_Of_Origin",37.29818],
+ UNIT["Meter",1.0]]'
+```
+
+```{r}
+zion_aeqd <- st_transform(zion, my_wkt)
+```
+
+Custom projections can also be made interactively, for example, using the [Projection Wizard](https://projectionwizard.org/#) web application [@savric_projection_2016].
+This website allows you to select a spatial extent of your data and a distortion property, and returns a list of possible projections.
+The list also contains WKT definitions of the projections that you can copy and use for reprojections.
+Also, see @opengeospatialconsortium_wellknown_2019 for details on creating custom CRS definitions with WKT strings
+
+When mapping the world while preserving area relationships, the Mollweide projection, illustrated in Figure 7.3, is a popular and often sensible choice (Jenny et al. 2017). To use this projection, we need to specify it using the proj-string element, "+proj=moll", in the st_transform function:
+
+```{r}
+world_mollweide <- st_transform(world, crs = "+proj=moll")
+```
+
+```
+world_mollweide_gr = st_graticule(lat = c(-89.9, seq(-80, 80, 20), 89.9)) |>
+  st_transform(crs = "+proj=moll")
+tm_shape(world_mollweide_gr) +
+  tm_lines(col = "gray") +
+  tm_shape(world_mollweide) +
+  tm_borders(col = "black") 
+```
+```{r}
+world_mw_graticules <- st_graticule(lat = c(-89.9, 
+                                            seq(-80, 80, 20),
+                                            89.9)) |> 
+  st_transform(crs = "+proj=moll")
+tm_shape(world_mollweide) +
+  tm_borders(col = "black") +
+  tm_shape(world_mw_graticules) +
+  tm_lines(col = "gray")
+```
+
+It is often desirable to minimize distortion for all spatial properties (area, direction, distance) when mapping the world. One of the most popular projections to achieve this is Winkel tripel, illustrated in Figure 7.4.39 The result was created with the following command:
+
+```{r}
+world_wintri <- st_transform(world, crs = "+proj=wintri")
+```
+
+```{r}
+world_wintri_gr <- st_graticule(
+  lat = c(-89.9, seq(-80, 80, 20), 89.9)
+  ) |>
+  st_transform(crs = "+proj=wintri")
+tm_shape(world_wintri) +
+  tm_borders(col = "black") +
+  tm_shape(world_wintri_gr) +
+  tm_lines(col = "gray")
+```
+
+Moreover, proj-string parameters can be modified in most CRS definitions, for example the center of the projection can be adjusted using the +lon_0 and +lat_0 parameters. The below code transforms the coordinates to the Lambert azimuthal equal-area projection centered on the longitude and latitude of New York City (Figure 7.5).
+
+```{r}
+world_laea2 = st_transform(
+  world,
+  crs = "+proj=laea +x_0=0 +y_0=0 +lon_0=-74 +lat_0=40"
+)
+```
+
+```{r}
+world_laea2_g <- st_graticule(ndiscr = 10000) |>
+  st_transform(
+    "+proj=laea +x_0=0 +y_0=0 +lon_0=-74 +lat_0=40.1 +ellps=WGS84 +no_defs"
+    ) |>
+  st_geometry()
+tm_shape(world_laea2_g) + 
+  tm_lines(col = "gray") +
+  tm_shape(world_laea2) + 
+  tm_borders(col = "black")
+```
+
+
+
+
